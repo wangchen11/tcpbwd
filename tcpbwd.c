@@ -58,7 +58,7 @@ static int listenOnPort(int port){
         perror("create socket failed");
         goto failed;
     }
-    
+
     bzero(&serverAddr,sizeof(serverAddr));//相当于memset
     serverAddr.sin_family = AF_INET;//ipv4
     serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);//设定监听的地址为任何地址都监听
@@ -68,6 +68,10 @@ static int listenOnPort(int port){
         perror("bind port failed");
         goto failed;
     }
+    
+    // 避免杀掉进程后端口仍被占用 
+    unsigned char resueaddr = 1;
+    setsockopt(socketfd, SOL_SOCKET, SO_REUSEADDR, (void *)&resueaddr, 1);
     
     //创建监听
     if(-1==listen(socketfd,MAX_CONNECT)){
@@ -104,28 +108,25 @@ static void setTimeout(int fd, int timeoutMs) {
  * 返回值若非-1需要用close关闭。
  */
 static int acceptForProtocol(int ctrlFd, char protocolRecv[], const char* recvProtocolHead) {
-    while(1) {
-        struct sockaddr_in clientAddr;
-        socklen_t socketLen = 0;
-        int clientFd = accept(ctrlFd,(struct sockaddr*)&clientAddr,&socketLen);
-        if (clientFd < 0) {
-            return -1;
-        }
-        setTimeout(ctrlFd, IO_TIMEOUT);
-        int len = read(clientFd, protocolRecv, PROTOCOL_SIZE);
-        if (len>=0) {
-            protocolRecv[len] = 0;
-        }
-        
-        printf("rcv:%d:%s\n", len, protocolRecv);
-        if(/*(len==PROTOCOL_SIZE) && */startWith(protocolRecv, recvProtocolHead)) {
-            printf("access accept. welecom.\n");
-            return clientFd;
-        }
-        printf("access denial\n");
-        close(clientFd);
-        sleep(1);
+    struct sockaddr_in clientAddr;
+    socklen_t socketLen = 0;
+    int clientFd = accept(ctrlFd,(struct sockaddr*)&clientAddr,&socketLen);
+    if (clientFd < 0) {
+        return -1;
     }
+    setTimeout(ctrlFd, IO_TIMEOUT);
+    int len = read(clientFd, protocolRecv, PROTOCOL_SIZE);
+    if (len>=0) {
+        protocolRecv[len] = 0;
+    }
+    
+    printf("rcv:%d:%s\n", len, protocolRecv);
+    if((len==PROTOCOL_SIZE) && startWith(protocolRecv, recvProtocolHead)) {
+        printf("access accept. welecom.\n");
+        return clientFd;
+    }
+    printf("access denial\n");
+    close(clientFd);
     return -1;
 }
 
@@ -252,13 +253,14 @@ static int proxyOnce(int ctrlFd,int toClientCtrlFd, int publishFd) {
         sprintf(protocol, CONNECTION_PLEASE"%d", id);
         if(PROTOCOL_SIZE != write(toClientCtrlFd, protocol, PROTOCOL_SIZE)) {
             perror("proxy once write failed. connection was broken.");
+            close(usefulFd);
             return -1;
         }
         int connectionFd = acceptForConnction(ctrlFd, id);
         if (connectionFd < 0) {
             fprintf(stderr, "accept for connection failed.\n");
-            usleep(10);
-            continue;
+            close(usefulFd);
+            return -1;
         }
         
         // usefulFd and connectionFd will close in bridge thread. do not close here.
@@ -267,7 +269,7 @@ static int proxyOnce(int ctrlFd,int toClientCtrlFd, int publishFd) {
             break;
         } else {
             fprintf(stderr, "start bridge thread failed.\n");
-            usleep(10);
+            usleep(100000);
             continue;
         }
     }
@@ -504,6 +506,7 @@ static int runClientWithLoop(const char* ctrlHost, int ctrlPort, const char* tar
 }
 
 int main(int argc,const char**argv) {
+	signal(SIGPIPE,SIG_IGN);
     if (argc >= 2) {
         if (strcmp(argv[1], "server")==0) {
             if (argc == 4) {

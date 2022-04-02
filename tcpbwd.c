@@ -174,12 +174,10 @@ static void* bridgeForwordThreadLoop(void* data) {
     int  readLen = 0;
     while (1) {
         readLen = read(fds.fda, buffer, MTU);
-        if (readLen < 0) {
+        if (readLen <= 0) {
             break;
         }
-        buffer[readLen] = 0;
-        puts(buffer);
-        if (write(fds.fdb, buffer, readLen)) {
+        if (write(fds.fdb, buffer, readLen) != readLen) {
             break;
         }
     }
@@ -259,7 +257,7 @@ static int proxyOnce(int ctrlFd,int toClientCtrlFd, int publishFd) {
         int connectionFd = acceptForConnction(ctrlFd, id);
         if (connectionFd < 0) {
             fprintf(stderr, "accept for connection failed.\n");
-            sleep(10);
+            usleep(10);
             continue;
         }
         
@@ -269,7 +267,7 @@ static int proxyOnce(int ctrlFd,int toClientCtrlFd, int publishFd) {
             break;
         } else {
             fprintf(stderr, "start bridge thread failed.\n");
-            sleep(10);
+            usleep(10);
             continue;
         }
     }
@@ -321,7 +319,7 @@ static int runServer(int ctrlPort, int publishPort) {
         if(toClientCtrlFd>=0) {
             close(toClientCtrlFd);
         }
-        sleep(1);
+        usleep(1);
     }
     
 finally:
@@ -402,7 +400,7 @@ static int recvNewConnection(int controllorFd) {
     char protocol[PROTOCOL_SIZE + 2];
     while(1) {
         int readLen = read(controllorFd, protocol, PROTOCOL_SIZE);
-        if (readLen<0) {
+        if (readLen<=0) {
             return -1;
         }
         protocol[readLen] = 0;
@@ -418,7 +416,6 @@ static int recvNewConnection(int controllorFd) {
         } else {
             printf("no full package recived, readLen:%d\n", readLen);
         }
-        sleep(1);
     }
     return -1;
 }
@@ -431,6 +428,7 @@ static int runClient(const char* ctrlHost, int ctrlPort, const char* targetHost,
     struct sockaddr_in ctrlSockAddr;
     struct sockaddr_in targetSockAddr;
     int ret = 0;
+    printf("run client %s:%d -> %s:%d \n", ctrlHost, ctrlPort, targetHost, targetPort);
 
     struct hostent* ctrlHostentPtr = gethostbyname(ctrlHost);
     if (ctrlHostentPtr == NULL) {
@@ -453,17 +451,20 @@ static int runClient(const char* ctrlHost, int ctrlPort, const char* targetHost,
     targetSockAddr.sin_family = targetHostentPtr->h_addrtype;
     targetSockAddr.sin_port   = htons(targetPort);
 
+    printf("connecting to controllor %s:%d\n", ctrlHost, ctrlPort);
     int controllorFd = connectToControllor(ctrlSockAddr);
+    printf("conneced   to controllor %s:%d\n", ctrlHost, ctrlPort);
     if (controllorFd<0) {
         fprintf(stderr, "connect to controllor failed: %s:%d\n", ctrlHost, ctrlPort);
         ret = -1;
         goto finally;
     }
+    printf("connect to %s:%d success.\n", ctrlHost, ctrlPort);
     
     while (1) {
         int newId = recvNewConnection(controllorFd);
         if (newId<0) {
-            fprintf(stderr, "recy new connection id failed:%d\n", newId);
+            fprintf(stderr, "recy new connection id failed.\n");
             ret = -1;
             goto finally;
         }
@@ -481,11 +482,9 @@ static int runClient(const char* ctrlHost, int ctrlPort, const char* targetHost,
             fprintf(stderr, "connect to target failed: %s:%d\n", targetHost, targetPort);
             close(connectionFd);
             // try again later
-            sleep(2);
+            usleep(10000);
         }
-
         startBridgeThread(connectionFd, targetFd);
-        sleep(1);
     }
 
 finally:
@@ -495,93 +494,39 @@ finally:
     return ret;
 }
 
-static int runClientEx(const char* ctrlAddress, const char* targetAddress) {
+static int runClientWithLoop(const char* ctrlHost, int ctrlPort, const char* targetHost, int targetPort) {
+    while(1) {
+        runClient(ctrlHost, ctrlPort, targetHost, targetPort);
+        printf("ctrl disconnected reconnect after 1 sec\n");
+        sleep(1);
+    }
     return 0;
 }
 
 int main(int argc,const char**argv) {
     if (argc >= 2) {
         if (strcmp(argv[1], "server")==0) {
-            runServer(58005, 8085);
-            return 0;
+            if (argc == 4) {
+                int portA = 0;
+                int portB = 0;
+                if ((sscanf(argv[2], "%d", &portA)==1) && (sscanf(argv[3], "%d", &portB)==1)) {
+                    runServer(portA, portB);
+                    return 0;
+                }
+            }
         } else if (strcmp(argv[1], "client")==0) {
-            runClient("127.0.0.1", 58005, "www.baidu.com", 80);
-            return 0;
+            if (argc == 4) {
+                char hostA[255];
+                char hostB[255];
+                int  portA = 0;
+                int  portB = 0;
+                if ((sscanf(argv[2], "%[^:]:%d", hostA, &portA)==2) && (sscanf(argv[3], "%[^:]:%d", hostB, &portB)==2)) {
+                    runClientWithLoop(hostA, portA, hostB, portB);
+                    return 0;
+                }
+            }
         }
     }
     puts(usage);
     return -1;
 }
-
-/*
-int fun()
-{
-    char readBuffer[101];
-    char writeBuffer[201];
-    int socketfd,connectfd;
-    struct sockaddr_in serverAddr;
-    signal(SIGPIPE,SIG_IGN);//屏蔽管道破解信号，一般服务器都会屏蔽这个型号 
-    socketfd = socket(AF_INET,SOCK_STREAM,0);//创建套接字 
-    if(socketfd==-1)
-    {
-        printf("创建套接字失败!\n");
-    }
-    else
-    {
-        printf("创建套接字成功!\n");
-        bzero(&serverAddr,sizeof(serverAddr));//相当于memset
-        serverAddr.sin_family = AF_INET;//ipv4
-        serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);//设定监听的地址为任何地址都监听
-        serverAddr.sin_port = htons(PORT);//设置端口号
-        //套接字与端口和地址绑定
-        if(-1==bind(socketfd,(struct sockaddr*)&serverAddr,sizeof(struct sockaddr)))
-        {
-            printf("绑定端口失败！\n");
-        }
-        else
-        {
-            printf("绑定端口成功！\n");
-            //创建监听
-            if(-1==listen(socketfd,MAX_CONNECT))
-            {
-                printf("创建监听失败！\n");
-            }
-            else
-            {
-                printf("创建监听成功！\n");
-                printf("地址:127.0.0.1:%d\n",PORT);
-                while(1)
-                {
-                    //sleep(1);
-                    socklen_t socketLen = 0;
-                    //等待客户端的连接到达 
-                    connectfd = accept(socketfd,(struct sockaddr*)&serverAddr,&socketLen);
-                    if(connectfd<=0)
-                    {
-                        printf("接受连接失败！\n");
-                    }
-                    else
-                    {
-                        printf("接受连接成功！\n");
-                        //接收数据 
-                        int readLength = read(connectfd,readBuffer,100);
-                        if(readLength>0)
-                        {
-                            readBuffer[readLength] = 0;
-                            printf("收到消息:%s,长度:%d\n",readBuffer,readLength);
-                            sprintf(writeBuffer,"received your msg:'%s'\n",readBuffer);
-                            //发送数据
-                            write(connectfd,writeBuffer,strlen(writeBuffer));
-                        }
-                        //关闭与客户端的连接
-                        close(connectfd);
-                    }
-                }
-            }
-        }
-        //FIXME 关闭套接字不知道是不是这个方法，反正感觉关闭失败了  
-        close(socketfd);
-    }
-    printf("程序结束\n");
-    return 0;
-}*/

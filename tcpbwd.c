@@ -149,7 +149,7 @@ static int acceptForConnction(int toClientCtrlFd, int id) {
         int recvId = 0;
         if(1==sscanf(protocolRecv, CONNECTION_HI"%d", &recvId)) {
             if (id == recvId) {
-                printf("accept connection:%d", id);
+                printf("accept connection id:%d fd:%d\n", id, fd);
                 return fd;
             } else {
                 fprintf(stderr, "accept request id:%d but recv id:%d", id, recvId);
@@ -165,17 +165,20 @@ static int acceptForConnction(int toClientCtrlFd, int id) {
 static void* bridgeForwordThreadLoop(void* data) {
     struct socket_bridge_fds fds = *(struct socket_bridge_fds*)data;
     free(data);
+    printf("bridgeForwordThreadLoop:%d -> %d start\n", fds.fda, fds.fdb);
 
     // setTimeout(fds.fda, IO_TIMEOUT);
     // setTimeout(fds.fdb, IO_TIMEOUT);
 
-    char buffer[MTU];
+    char buffer[MTU + 1];
     int  readLen = 0;
     while (1) {
         readLen = read(fds.fda, buffer, MTU);
-        if (readLen <= 0) {
+        if (readLen < 0) {
             break;
         }
+        buffer[readLen] = 0;
+        puts(buffer);
         if (write(fds.fdb, buffer, readLen)) {
             break;
         }
@@ -185,6 +188,7 @@ static void* bridgeForwordThreadLoop(void* data) {
         close(fds.fda);
         close(fds.fdb);
     }
+    printf("bridgeForwordThreadLoop:%d -> %d end\n", fds.fda, fds.fdb);
     return NULL;
 }
 
@@ -234,7 +238,7 @@ static int startBridgeThread(int fda, int fdb) {
  * @param publishFd 
  * @return int 大于等于0正常. 小于0则客户端可能已断开需要断开连接。
  */
-static int proxyOnce(int toClientCtrlFd, int publishFd) {
+static int proxyOnce(int ctrlFd,int toClientCtrlFd, int publishFd) {
     char protocol[PROTOCOL_SIZE + 2];
     static int id = 0;
     struct sockaddr_in clientAddr;
@@ -252,19 +256,29 @@ static int proxyOnce(int toClientCtrlFd, int publishFd) {
             perror("proxy once write failed. connection was broken.");
             return -1;
         }
-        int connectionFd = acceptForConnction(toClientCtrlFd, id);
+        int connectionFd = acceptForConnction(ctrlFd, id);
+        if (connectionFd < 0) {
+            fprintf(stderr, "accept for connection failed.\n");
+            sleep(10);
+            continue;
+        }
+        
         // usefulFd and connectionFd will close in bridge thread. do not close here.
-        if(startBridgeThread(usefulFd, connectionFd)!=0) {
-            fprintf(stderr, "start bridge thread failed.\n");
+        if(startBridgeThread(usefulFd, connectionFd)==0) {
+            // succss, break loop.
             break;
+        } else {
+            fprintf(stderr, "start bridge thread failed.\n");
+            sleep(10);
+            continue;
         }
     }
     return 0;
 }
 
-static int proxyByClient(int toClientCtrlFd, int publishFd) {
+static int proxyByClient(int ctrlFd, int toClientCtrlFd, int publishFd) {
     while (1) {
-        int ret = proxyOnce(toClientCtrlFd, publishFd);
+        int ret = proxyOnce(ctrlFd, toClientCtrlFd, publishFd);
         if(ret < 0) {
             return ret;
         }
@@ -303,7 +317,7 @@ static int runServer(int ctrlPort, int publishPort) {
             ret = -1;
             goto finally;
         }
-        proxyByClient(toClientCtrlFd, publishFd);
+        proxyByClient(ctrlFd, toClientCtrlFd, publishFd);
         if(toClientCtrlFd>=0) {
             close(toClientCtrlFd);
         }
@@ -473,7 +487,7 @@ static int runClient(const char* ctrlHost, int ctrlPort, const char* targetHost,
         startBridgeThread(connectionFd, targetFd);
         sleep(1);
     }
-    
+
 finally:
     if (controllorFd>0) {
         close(controllorFd);
@@ -485,14 +499,12 @@ static int runClientEx(const char* ctrlAddress, const char* targetAddress) {
     return 0;
 }
 
-
-
 int main(int argc,const char**argv) {
     if (argc >= 2) {
-        if (strcmp(argv[1], "server")) {
+        if (strcmp(argv[1], "server")==0) {
             runServer(58005, 8085);
             return 0;
-        } else if (strcmp(argv[1], "client")) {
+        } else if (strcmp(argv[1], "client")==0) {
             runClient("127.0.0.1", 58005, "www.baidu.com", 80);
             return 0;
         }

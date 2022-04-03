@@ -33,6 +33,54 @@ by 望尘11
 #define OK_RESPONSE       "ok#got it#"                         // OK response 
 #define NG_RESPONSE       "no#i can't#"                        // NG response 
 
+static volatile int running = 1;
+static int sigint_count = 0;
+
+void shutdownAllOpeningFd() {
+    char path[255];
+    for (int i = 3; i <= 0xffff; i++) {
+        sprintf(path, "/proc/self/fd/%d", i);
+        if (access(path, F_OK) == 0) {
+            printf("emergency shutdown fd:%d\n", i);
+            shutdown(i, SHUT_RDWR);
+        }
+    }
+}
+
+void checkFdBeforeExit() {
+    char path[255];
+    for (int i = 3; i <= 65535; i++) {
+        sprintf(path, "/proc/self/fd/%d", i);
+        if (access(path, F_OK) == 0) {
+            printf("on exit fd %d still exist. give up!\n", i);
+        }
+    }
+}
+
+void signalHandler(int signo) {
+    switch (signo) {
+        case SIGPIPE: {
+            printf("SIGPIPE received. ignore!\n");
+            break;
+        }
+        case SIGINT: {
+            if (sigint_count>=3) {
+                printf("\nSIGINT received 3 times! exit now!!!\n");
+                checkFdBeforeExit();
+                exit(0);
+                break;
+            }
+            if (sigint_count==0) {
+                printf("\nSIGINT received! shuting down now.\n");
+                shutdownAllOpeningFd();
+            }
+            running = 0;
+            sigint_count++;
+            break;
+        }
+    }
+}
+
 static const char*usage = 
         "tcpbwd server <CTRL_PORT>        <PUBLISH_PORT>\n"\
         "tcpbwd client <HOST_A:CTRL_PORT> <TARGET_IP:TARGET_PORT>\n"\
@@ -120,8 +168,8 @@ static int listenOnPort(int port){
     }
     
     // 避免杀掉进程后端口仍被占用 
-    unsigned char resueaddr = 1;
-    setsockopt(socketfd, SOL_SOCKET, SO_REUSEADDR, (void *)&resueaddr, 1);
+    // unsigned char resueaddr = 1;
+    // setsockopt(socketfd, SOL_SOCKET, SO_REUSEADDR, (void *)&resueaddr, 1);
     
     //创建监听
     if(-1==listen(socketfd,MAX_CONNECT)){
@@ -220,14 +268,22 @@ static void* bridgeForwordThreadLoop(void* data) {
     // setTimeout(fds.fdb, IO_TIMEOUT);
 
     char buffer[MTU + 1];
-    while (1) {
+    while (running) {
         int readLen = read(fds.fda, buffer, MTU);
+        if (readLen == 0) {
+            printf("bridgeForwordThreadLoop:fd:%d was close by remote.\n", fds.fda);
+            break;
+        }
         if (readLen < 0) {
             perror("read error");
             printf("bridgeForwordThreadLoop:%d -> %d. read failed, readLen = %d\n", fds.fda, fds.fdb, readLen);
             break;
         }
         int writeLen = write(fds.fdb, buffer, readLen);
+        if (writeLen == 0) {
+            printf("bridgeForwordThreadLoop:fd:%d was close by remote.\n", fds.fdb);
+            break;
+        }
         if (readLen != writeLen) {
             printf("bridgeForwordThreadLoop:%d -> %d. write failed, readLen(%d) != writeLen(%d)\n", fds.fda, fds.fdb, readLen, writeLen);
             break;
@@ -235,10 +291,13 @@ static void* bridgeForwordThreadLoop(void* data) {
     }
     
     /**
-     * close our fdb(write fd only). In backword thread it is an read fd.
-     * fda(read fd) will close in backword thread.
+     * fda will never use. close it.
+     * fdb using in anouther thread. shutdown it. then anouther thread will read 0.
      */
-    close(fds.fdb);
+     
+    int ret = close(fds.fda);
+    printf("bridgeForwordThreadLoop close return %d  fd:%d\n",ret , fds.fda);
+    shutdown(fds.fdb, SHUT_RDWR);
     printf("bridgeForwordThreadLoop:%d -> %d end\n", fds.fda, fds.fdb);
     return NULL;
 }
@@ -333,7 +392,7 @@ static int proxyOnce(int ctrlFd,int toClientCtrlFd, int publishFd) {
 }
 
 static int proxyByClient(int ctrlFd, int toClientCtrlFd, int publishFd) {
-    while (1) {
+    while (running) {
         int ret = proxyOnce(ctrlFd, toClientCtrlFd, publishFd);
         if(ret < 0) {
             return ret;
@@ -367,8 +426,7 @@ static int runServer(int ctrlPort, int publishPort) {
     
     printf("listen on ctrl port %d and publish port %d success. waiting for connection.\n", ctrlPort, publishPort);
 
-    while(1)
-    {
+    while (running) {
         int toClientCtrlFd = acceptForControllor(ctrlFd);
         if (toClientCtrlFd<0) {
             perror("accept for controllor failed\n");
@@ -385,10 +443,10 @@ static int runServer(int ctrlPort, int publishPort) {
     
 finally:
     if(ctrlFd>=0) {
-        shutdown(ctrlFd, SHUT_RDWR);
+        close(ctrlFd);
     }
     if(publishFd>=0) {
-        shutdown(publishFd, SHUT_RDWR);
+        close(publishFd);
     }
     return ret;
 }
@@ -404,12 +462,12 @@ finally:
  * @return int 返回值大于0 时需要用close关闭
  */
 static int connectByProtocol(struct sockaddr_in addr, const char* sendProtocolHead) {
-	int socketfd = socket(addr.sin_family, SOCK_STREAM, 0); //创建套接字 ,AF_NET:ipv4，SOCK_STREAM:TCP协议 
+    int socketfd = socket(addr.sin_family, SOCK_STREAM, 0); //创建套接字 ,AF_NET:ipv4，SOCK_STREAM:TCP协议 
 
-	if(socketfd == -1) {
+    if(socketfd == -1) {
         perror("create socket failed");
         goto failed;
-	}
+    }
     
     if(-1 == connect(socketfd,(struct sockaddr*)&addr,sizeof(struct sockaddr))) {
         perror("connect server failed");
@@ -417,6 +475,7 @@ static int connectByProtocol(struct sockaddr_in addr, const char* sendProtocolHe
     }
     
     if (sendProtocolHead==NULL) {
+        // no protocol, return raw connection.
         return socketfd;
     }
     
@@ -468,11 +527,14 @@ static int connectToConnection(struct sockaddr_in addr, int id) {
  */
 static int recvNewConnection(int controllorFd) {
     char protocolRecv[PROTOCOL_SIZE + 2];
-    // TODO 
-    while(1) {
+    while (running) {
         printf("recvNewConnection start read\n");
         int readLen = read(controllorFd, protocolRecv, PROTOCOL_SIZE);
-        if (readLen<=0) {
+        if (readLen==0) {
+            printf("connect close by remote when read new connection.\n");
+            return -1;
+        }
+        if (readLen<0) {
             perror("cannot read new connection");
             return -1;
         }
@@ -538,10 +600,10 @@ static int runClient(const char* ctrlHost, int ctrlPort, const char* targetHost,
     }
     printf("connect to %s:%d success.\n", ctrlHost, ctrlPort);
     
-    while (1) {
+    while (running) {
         int newId = recvNewConnection(controllorFd);
         if (newId<0) {
-            fprintf(stderr, "recy new connection id failed.\n");
+            fprintf(stderr, "recv new connection id failed.\n");
             ret = -1;
             goto finally;
         }
@@ -572,23 +634,29 @@ finally:
 }
 
 static int runClientWithLoop(const char* ctrlHost, int ctrlPort, const char* targetHost, int targetPort) {
-    while(1) {
+    while (running) {
         runClient(ctrlHost, ctrlPort, targetHost, targetPort);
-        printf("ctrl disconnected reconnect after 1 sec\n");
-        sleep(1);
+        printf("ctrl disconnected, reconnect after 10 sec\n");
+        if (running) {
+            sleep(10);
+        }
     }
     return 0;
 }
 
 int main(int argc,const char**argv) {
-	// signal(SIGPIPE,SIG_IGN);
     if (argc >= 2) {
         if (strcmp(argv[1], "server")==0) {
             if (argc == 4) {
                 int portA = 0;
                 int portB = 0;
                 if ((sscanf(argv[2], "%d", &portA)==1) && (sscanf(argv[3], "%d", &portB)==1)) {
+                    signal(SIGPIPE, signalHandler);
+                    signal(SIGINT,  signalHandler);
                     runServer(portA, portB);
+                    if (!running) {
+                        sleep(2);
+                    }
                     return 0;
                 }
             }
@@ -599,7 +667,11 @@ int main(int argc,const char**argv) {
                 int  portA = 0;
                 int  portB = 0;
                 if ((sscanf(argv[2], "%[^:]:%d", hostA, &portA)==2) && (sscanf(argv[3], "%[^:]:%d", hostB, &portB)==2)) {
+                    signal(SIGINT,  signalHandler);
                     runClientWithLoop(hostA, portA, hostB, portB);
+                    if (!running) {
+                        sleep(2);
+                    }
                     return 0;
                 }
             }

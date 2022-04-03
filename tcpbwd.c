@@ -22,7 +22,7 @@ by 望尘11
 */
 
 #define MAX_CONNECT     500 //最大连接数
-#define PROTOCOL_SIZE   64  //协议头长度为固定64字节
+#define PROTOCOL_SIZE   128  //协议头长度为固定128字节
 #define IO_TIMEOUT      (30*1000)  //读写超时时间，单位ms
 #define MTU             1500 // 每次读取最大长度
 
@@ -30,6 +30,8 @@ by 望尘11
 #define CONNECTION_HI     "hi#i am tcpbwd connection client#"  // CLIENT TO HOST, after this string is connection id.
 #define HI_RESPONSE       "hi#i am tcpbwd server#"             // HOST TO CLIENT,
 #define CONNECTION_PLEASE "please#new connection#"             // HOST TO CLIENT, after this string is connection id.
+#define OK_RESPONSE       "ok#got it#"                         // OK response 
+#define NG_RESPONSE       "no#i can't#"                        // NG response 
 
 static const char*usage = 
         "tcpbwd server <CTRL_PORT>        <PUBLISH_PORT>\n"\
@@ -44,8 +46,56 @@ static int startWith(const char* longStr, const char* shortStr) {
 struct socket_bridge_fds {
     int fda;
     int fdb;
-    int requestClose; // 是否需要关闭句柄 
 };
+
+static int response(int fd, const char* head, const char* msg) {
+    char protocolSend[PROTOCOL_SIZE + 2];
+    memset(protocolSend, 0, PROTOCOL_SIZE);
+    // TODO check msg length in range
+    sprintf(protocolSend, "%s%s", head, msg);
+    printf("## response ##%s\n", protocolSend);
+    if (write(fd, protocolSend, PROTOCOL_SIZE) != PROTOCOL_SIZE) {
+        return -1;
+    }
+    return 0;
+}
+
+static int responseOk(int fd, const char* msg) {
+    return response(fd, OK_RESPONSE, msg);
+}
+
+static int responseNg(int fd, const char* msg) {
+    return response(fd, NG_RESPONSE, msg);
+}
+
+/**
+ * 接受一个客户端的某种协议
+ * @param protocolRecv 长度至少为PROTOCOL_SIZE + 1, 
+ * @param recvProtocolHead 期望的协议头
+ * @return 0成功，其他:失败。
+ */
+static int recvForProtocol(int fd, char protocolRecv[], const char* recvProtocolHead) {
+    printf("## expected ####%s\n", recvProtocolHead);
+    int len = read(fd, protocolRecv, PROTOCOL_SIZE);
+    if (len>=0) {
+        protocolRecv[len] = 0;
+    }
+    printf("## received ##%d##%s\n", len, protocolRecv);
+    if((len==PROTOCOL_SIZE) && startWith(protocolRecv, recvProtocolHead)) {
+        return 0;
+    }
+    return -1;
+}
+
+static int recvOk(int fd) {
+    char protocolRecv[PROTOCOL_SIZE + 2];
+    memset(protocolRecv, 0, sizeof(protocolRecv));
+    int ret = recvForProtocol(fd, protocolRecv, OK_RESPONSE);
+    if (ret != 0) {
+        printf("received not ok response:%s\n", protocolRecv);
+    }
+    return ret;
+}
 
 /**
  * 监听一个端口并返回socket fd, 返回值＞0时需要用shutdown(socketfd, SHUT_RDWR);关闭
@@ -100,7 +150,6 @@ static void setTimeout(int fd, int timeoutMs) {
     }
 }
 
-
 /**
  * 等待一个客户端的某种协议连接
  * @pragma protocolRecv 长度至少为PROTOCOL_SIZE + 1, 
@@ -114,17 +163,14 @@ static int acceptForProtocol(int ctrlFd, char protocolRecv[], const char* recvPr
     if (clientFd < 0) {
         return -1;
     }
-    setTimeout(ctrlFd, IO_TIMEOUT);
-    int len = read(clientFd, protocolRecv, PROTOCOL_SIZE);
-    if (len>=0) {
-        protocolRecv[len] = 0;
-    }
-    
-    printf("rcv:%d:%s\n", len, protocolRecv);
-    if((len==PROTOCOL_SIZE) && startWith(protocolRecv, recvProtocolHead)) {
+
+    if(recvForProtocol(clientFd, protocolRecv, recvProtocolHead)==0) {
+        responseOk(clientFd, "access accept. welecom.");
         printf("access accept. welecom.\n");
         return clientFd;
     }
+
+    responseNg(clientFd, "access denial");
     printf("access denial\n");
     close(clientFd);
     return -1;
@@ -145,6 +191,7 @@ static int acceptForControllor(int ctrlFd) {
  */
 static int acceptForConnction(int toClientCtrlFd, int id) {
     char protocolRecv[PROTOCOL_SIZE + 2];
+
     int fd = acceptForProtocol(toClientCtrlFd, protocolRecv, CONNECTION_HI);
     if (fd >= 0) {
         int recvId = 0;
@@ -158,6 +205,7 @@ static int acceptForConnction(int toClientCtrlFd, int id) {
         } else {
             fprintf(stderr, "can not parse protocol:%s", protocolRecv);
         }
+        printf("accept for connection. access denial\n");
         close(fd);
     }
     return -1;
@@ -172,21 +220,25 @@ static void* bridgeForwordThreadLoop(void* data) {
     // setTimeout(fds.fdb, IO_TIMEOUT);
 
     char buffer[MTU + 1];
-    int  readLen = 0;
     while (1) {
-        readLen = read(fds.fda, buffer, MTU);
-        if (readLen <= 0) {
+        int readLen = read(fds.fda, buffer, MTU);
+        if (readLen < 0) {
+            perror("read error");
+            printf("bridgeForwordThreadLoop:%d -> %d. read failed, readLen = %d\n", fds.fda, fds.fdb, readLen);
             break;
         }
-        if (write(fds.fdb, buffer, readLen) != readLen) {
+        int writeLen = write(fds.fdb, buffer, readLen);
+        if (readLen != writeLen) {
+            printf("bridgeForwordThreadLoop:%d -> %d. write failed, readLen(%d) != writeLen(%d)\n", fds.fda, fds.fdb, readLen, writeLen);
             break;
         }
     }
     
-    if (fds.requestClose) {
-        close(fds.fda);
-        close(fds.fdb);
-    }
+    /**
+     * close our fdb(write fd only). In backword thread it is an read fd.
+     * fda(read fd) will close in backword thread.
+     */
+    close(fds.fdb);
     printf("bridgeForwordThreadLoop:%d -> %d end\n", fds.fda, fds.fdb);
     return NULL;
 }
@@ -206,13 +258,10 @@ static int startBridgeThread(int fda, int fdb) {
     // 正向读写代理
     forwardFds->fda = fda;
     forwardFds->fdb = fdb;
-    forwardFds->requestClose = 1;
 
     // 反向读写代理
     backwordFds->fda = fdb;
     backwordFds->fdb = fda;
-    // 只需让正向代理关闭即可，这里置位false 
-    backwordFds->requestClose = 0;
     
 
     int ret = 0;
@@ -242,36 +291,43 @@ static int proxyOnce(int ctrlFd,int toClientCtrlFd, int publishFd) {
     static int id = 0;
     struct sockaddr_in clientAddr;
     socklen_t socketLen = 0;
+
+    printf("proxyOnce\n");
     int usefulFd = accept(publishFd,(struct sockaddr*)&clientAddr,&socketLen);
     if (usefulFd < 0) {
         perror("proxy once accept failed");
         return -1;
     }
-    while(1) {
-        id++;
-        id = id % 0xffffff;
-        sprintf(protocol, CONNECTION_PLEASE"%d", id);
-        if(PROTOCOL_SIZE != write(toClientCtrlFd, protocol, PROTOCOL_SIZE)) {
-            perror("proxy once write failed. connection was broken.");
-            close(usefulFd);
-            return -1;
-        }
-        int connectionFd = acceptForConnction(ctrlFd, id);
-        if (connectionFd < 0) {
-            fprintf(stderr, "accept for connection failed.\n");
-            close(usefulFd);
-            return -1;
-        }
-        
-        // usefulFd and connectionFd will close in bridge thread. do not close here.
-        if(startBridgeThread(usefulFd, connectionFd)==0) {
-            // succss, break loop.
-            break;
-        } else {
-            fprintf(stderr, "start bridge thread failed.\n");
-            usleep(100000);
-            continue;
-        }
+
+    id++;
+    id = id % 0xffffff;
+    sprintf(protocol, CONNECTION_PLEASE"%d", id);
+    printf("## send ##%s\n", protocol);
+    if (PROTOCOL_SIZE != write(toClientCtrlFd, protocol, PROTOCOL_SIZE)) {
+        perror("proxy once write failed. connection was broken.");
+        close(usefulFd);
+        return -1;
+    }
+
+    printf("waiting for connection %d response ok.\n", id);
+    if (recvOk(toClientCtrlFd)!=0) {
+        fprintf(stderr, "proxy once can not recv ok.\n");
+        close(usefulFd);
+        return -1;
+    }
+    printf("connection %d connected.\n", id);
+
+    int connectionFd = acceptForConnction(ctrlFd, id);
+    if (connectionFd < 0) {
+        fprintf(stderr, "accept for connection failed.\n");
+        close(usefulFd);
+        return -1;
+    }
+    
+    if(startBridgeThread(usefulFd, connectionFd) != 0) {
+        fprintf(stderr, "start bridge thread failed.\n");
+        // usefulFd and connectionFd will close in startBridgeThread or bridge thread. do not close here.
+        return -1;
     }
     return 0;
 }
@@ -309,7 +365,9 @@ static int runServer(int ctrlPort, int publishPort) {
         goto finally;
     }
     
-    while(1) 
+    printf("listen on ctrl port %d and publish port %d success. waiting for connection.\n", ctrlPort, publishPort);
+
+    while(1)
     {
         int toClientCtrlFd = acceptForControllor(ctrlFd);
         if (toClientCtrlFd<0) {
@@ -317,6 +375,7 @@ static int runServer(int ctrlPort, int publishPort) {
             ret = -1;
             goto finally;
         }
+        setTimeout(toClientCtrlFd, IO_TIMEOUT);
         proxyByClient(ctrlFd, toClientCtrlFd, publishFd);
         if(toClientCtrlFd>=0) {
             close(toClientCtrlFd);
@@ -362,10 +421,19 @@ static int connectByProtocol(struct sockaddr_in addr, const char* sendProtocolHe
     }
     
 
+    printf("## send ##%s\n", sendProtocolHead);
     if(write(socketfd, sendProtocolHead, PROTOCOL_SIZE) != PROTOCOL_SIZE) {
         perror("send protocol head failed");
         goto failed;
     }
+
+    printf("connect by protocol waiting for recvOk\n");
+    if(recvOk(socketfd) != 0) {
+        fprintf(stderr, "'%s' was send,but can not recv ok response.\n", sendProtocolHead);
+        goto failed;
+    }
+
+    printf("connected.\n");
     return socketfd;
 failed:
     if (socketfd>0) {
@@ -399,24 +467,32 @@ static int connectToConnection(struct sockaddr_in addr, int id) {
  * @return int 请求id。 大于等于0时可连接，
  */
 static int recvNewConnection(int controllorFd) {
-    char protocol[PROTOCOL_SIZE + 2];
+    char protocolRecv[PROTOCOL_SIZE + 2];
+    // TODO 
     while(1) {
-        int readLen = read(controllorFd, protocol, PROTOCOL_SIZE);
+        printf("recvNewConnection start read\n");
+        int readLen = read(controllorFd, protocolRecv, PROTOCOL_SIZE);
         if (readLen<=0) {
+            perror("cannot read new connection");
             return -1;
         }
-        protocol[readLen] = 0;
+        printf("recvNewConnection end  read\n");
+        protocolRecv[readLen] = 0;
         if (readLen==PROTOCOL_SIZE) {
-            if (startWith(protocol, CONNECTION_PLEASE)) {
-                printf("new connection please:%s\n", protocol);
+            if (startWith(protocolRecv, CONNECTION_PLEASE)) {
+                printf("new connection please:%s\n", protocolRecv);
                 int id = 0;
-                if (sscanf(protocol, CONNECTION_PLEASE"%d", &id)==1) {
+                if (sscanf(protocolRecv, CONNECTION_PLEASE"%d", &id)==1) {
                     printf("got new connection:%d\n", id);
+                    responseOk(controllorFd, "got new connection");
                     return id;
                 }
             }
+            responseNg(controllorFd, "protocol parse failed");
+            fprintf(stderr, "new connection protocol parse failed:%s continue.\n", protocolRecv);
         } else {
-            printf("no full package recived, readLen:%d\n", readLen);
+            responseNg(controllorFd, "no full package recived");
+            fprintf(stderr, "no full package recived, readLen:%d\n", readLen);
         }
     }
     return -1;
@@ -455,7 +531,6 @@ static int runClient(const char* ctrlHost, int ctrlPort, const char* targetHost,
 
     printf("connecting to controllor %s:%d\n", ctrlHost, ctrlPort);
     int controllorFd = connectToControllor(ctrlSockAddr);
-    printf("conneced   to controllor %s:%d\n", ctrlHost, ctrlPort);
     if (controllorFd<0) {
         fprintf(stderr, "connect to controllor failed: %s:%d\n", ctrlHost, ctrlPort);
         ret = -1;
@@ -506,7 +581,7 @@ static int runClientWithLoop(const char* ctrlHost, int ctrlPort, const char* tar
 }
 
 int main(int argc,const char**argv) {
-	signal(SIGPIPE,SIG_IGN);
+	// signal(SIGPIPE,SIG_IGN);
     if (argc >= 2) {
         if (strcmp(argv[1], "server")==0) {
             if (argc == 4) {

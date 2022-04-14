@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <netdb.h>
+#include <errno.h>
 
 /*
 tcpbwd is TCP backward.
@@ -32,6 +33,7 @@ by 望尘11
 #define CONNECTION_PLEASE "please#new connection#"             // HOST TO CLIENT, after this string is connection id.
 #define OK_RESPONSE       "ok#got it#"                         // OK response 
 #define NG_RESPONSE       "no#i can't#"                        // NG response 
+#define TEST_ALIVE_RESPONSE       "test alive##"                       // NG response 
 
 static volatile int running = 1;
 static int sigint_count = 0;
@@ -124,13 +126,20 @@ static int responseNg(int fd, const char* msg) {
  */
 static int recvForProtocol(int fd, char protocolRecv[], const char* recvProtocolHead) {
     printf("## expected ####%s\n", recvProtocolHead);
-    int len = read(fd, protocolRecv, PROTOCOL_SIZE);
-    if (len>=0) {
-        protocolRecv[len] = 0;
-    }
-    printf("## received ##%d##%s\n", len, protocolRecv);
-    if((len==PROTOCOL_SIZE) && startWith(protocolRecv, recvProtocolHead)) {
-        return 0;
+    while (1) {
+        int len = read(fd, protocolRecv, PROTOCOL_SIZE);
+        if (len>=0) {
+            protocolRecv[len] = 0;
+        }
+        if((len==PROTOCOL_SIZE) && startWith(protocolRecv, TEST_ALIVE_RESPONSE)) {
+            continue;
+        }
+        printf("## received ##%d##%s\n", len, protocolRecv);
+        if((len==PROTOCOL_SIZE) && startWith(protocolRecv, recvProtocolHead)) {
+            return 0;
+        } else {
+            return -1;
+        }
     }
     return -1;
 }
@@ -351,8 +360,30 @@ static int proxyOnce(int ctrlFd,int toClientCtrlFd, int publishFd) {
     struct sockaddr_in clientAddr;
     socklen_t socketLen = 0;
 
-    printf("proxyOnce\n");
-    int usefulFd = accept(publishFd,(struct sockaddr*)&clientAddr,&socketLen);
+    printf("proxyOnce %d\n", publishFd);
+    int usefulFd = -1;
+    {
+        fd_set selectFdSet;
+        struct timeval selectTimeOut;
+        int ms = 4*1000;
+        selectTimeOut.tv_sec  = ms/1000;
+        selectTimeOut.tv_usec = ms%1000 * 1000;
+        
+        FD_ZERO(&selectFdSet);
+        FD_SET(publishFd, &selectFdSet);
+        int selectRet = select(publishFd + 1, &selectFdSet, NULL, NULL, &selectTimeOut);
+        if (selectRet > 0) {
+            usefulFd = accept(publishFd, (struct sockaddr*)&clientAddr, &socketLen);
+            printf("proxyOnce accepted %d\n", usefulFd);
+        } else if (selectRet == 0) {
+            // printf("proxyOnce select time out\n");
+            return 0;
+        } else { // selectRet<0
+            perror("proxyOnce select error");
+            return -1;
+        }
+    }
+
     if (usefulFd < 0) {
         perror("proxy once accept failed");
         return -1;
@@ -388,6 +419,7 @@ static int proxyOnce(int ctrlFd,int toClientCtrlFd, int publishFd) {
         // usefulFd and connectionFd will close in startBridgeThread or bridge thread. do not close here.
         return -1;
     }
+    printf("proxyOnce end\n");
     return 0;
 }
 
@@ -396,6 +428,15 @@ static int proxyByClient(int ctrlFd, int toClientCtrlFd, int publishFd) {
         int ret = proxyOnce(ctrlFd, toClientCtrlFd, publishFd);
         if(ret < 0) {
             return ret;
+        }
+        char buffer[PROTOCOL_SIZE + 2] = TEST_ALIVE_RESPONSE;
+        setTimeout(toClientCtrlFd, 0);
+        // test client alive.
+        if (write(toClientCtrlFd, buffer, PROTOCOL_SIZE) < 0) {
+            // connection is not alive.
+            printf("proxyByClient toClientCtrlFd %d was closed\n", toClientCtrlFd);
+            perror("proxyByClient recv error");
+            return -1;
         }
     }
     return 0;
@@ -433,7 +474,6 @@ static int runServer(int ctrlPort, int publishPort) {
             ret = -1;
             goto finally;
         }
-        setTimeout(toClientCtrlFd, IO_TIMEOUT);
         proxyByClient(ctrlFd, toClientCtrlFd, publishFd);
         if(toClientCtrlFd>=0) {
             close(toClientCtrlFd);
@@ -528,7 +568,6 @@ static int connectToConnection(struct sockaddr_in addr, int id) {
 static int recvNewConnection(int controllorFd) {
     char protocolRecv[PROTOCOL_SIZE + 2];
     while (running) {
-        printf("recvNewConnection start read\n");
         int readLen = read(controllorFd, protocolRecv, PROTOCOL_SIZE);
         if (readLen==0) {
             printf("connect close by remote when read new connection.\n");
@@ -538,9 +577,12 @@ static int recvNewConnection(int controllorFd) {
             perror("cannot read new connection");
             return -1;
         }
-        printf("recvNewConnection end  read\n");
         protocolRecv[readLen] = 0;
         if (readLen==PROTOCOL_SIZE) {
+            if (startWith(protocolRecv, TEST_ALIVE_RESPONSE)) {
+                continue;
+            }
+
             if (startWith(protocolRecv, CONNECTION_PLEASE)) {
                 printf("new connection please:%s\n", protocolRecv);
                 int id = 0;
@@ -551,7 +593,7 @@ static int recvNewConnection(int controllorFd) {
                 }
             }
             responseNg(controllorFd, "protocol parse failed");
-            fprintf(stderr, "new connection protocol parse failed:%s continue.\n", protocolRecv);
+            fprintf(stderr, "new connection protocol parse failed:%s\n", protocolRecv);
         } else {
             responseNg(controllorFd, "no full package recived");
             fprintf(stderr, "no full package recived, readLen:%d\n", readLen);
@@ -636,9 +678,9 @@ finally:
 static int runClientWithLoop(const char* ctrlHost, int ctrlPort, const char* targetHost, int targetPort) {
     while (running) {
         runClient(ctrlHost, ctrlPort, targetHost, targetPort);
-        printf("ctrl disconnected, reconnect after 10 sec\n");
         if (running) {
             sleep(10);
+            printf("ctrl disconnected, reconnect after 10 sec\n");
         }
     }
     return 0;

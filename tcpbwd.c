@@ -308,6 +308,7 @@ static void* bridgeForwordThreadLoop(void* data) {
     printf("bridgeForwordThreadLoop close return %d  fd:%d\n",ret , fds.fda);
     shutdown(fds.fdb, SHUT_RDWR);
     printf("bridgeForwordThreadLoop:%d -> %d end\n", fds.fda, fds.fdb);
+    pthread_detach(pthread_self());
     return NULL;
 }
 
